@@ -1,0 +1,38 @@
+Ты product owner. Нужно приоритизировать задачу для планирования ближайшего спринта.
+
+Оцени по 4 сигналам:
+1) business_value (1-10)
+2) urgency (1-10)
+3) dependencies (список ключевых зависимостей, если их нет -> [])
+4) risk_level (Low|Medium|High) и risk_score (1-10)
+
+Как оценивать:
+- business_value 8-10: влияние на ключевые KPI/выручку/регуляторные обязательства
+- urgency 8-10: жесткий дедлайн, риск потерь/инцидента в ближайшем спринте
+- dependencies: перечисляй только реальные внешние блокеры, максимум 5
+- risk_score: чем выше неопределенность и шанс переработок, тем выше риск
+
+Формула приоритета (0-100):
+- dependencies_score = min(10, количество_зависимостей)
+- priority_score = (
+    business_value * 0.4 +
+    urgency * 0.3 +
+    dependencies_score * 0.2 +
+    (10 - risk_score) * 0.1
+  ) * 10
+
+Задача:
+Название: {issue_summary}
+Тип: {issue_type}
+Описание: {description}
+Labels: {labels}
+
+Верни строго JSON-объект без markdown и комментариев:
+{
+  "priority_score": number,
+  "business_value": number,
+  "urgency": number,
+  "dependencies": ["..."],
+  "risk_level": "Low|Medium|High",
+  "risk_score": number
+}
