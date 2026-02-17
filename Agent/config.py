@@ -25,7 +25,7 @@ class Config:
     MAX_DEPENDENCIES = 5
     FORCE_REESTIMATE_IN_PLAN = True
     FORCE_REPRIORITIZE_IN_PLAN = True
-    SEND_MAX_TOKENS = 10000
+    SEND_MAX_TOKENS = False
 
     # Параметры планирования спринта
     ANALYSTS = ["analyst_1", "analyst_2", "analyst_3", "analyst_4"]

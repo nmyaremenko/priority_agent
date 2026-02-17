@@ -48,12 +48,66 @@ class TaskEstimatorAgent:
                 text = ""
         return text
 
+    def _extract_text_content(self, content: Any) -> str:
+        """Нормализация message.content к строке для разных форматов API."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    value = item.get("text")
+                    if isinstance(value, str):
+                        parts.append(value)
+            return "".join(parts)
+        if isinstance(content, dict):
+            value = content.get("text")
+            if isinstance(value, str):
+                return value
+        return str(content)
+
+    def _extract_json_object(self, text: str) -> Optional[str]:
+        """Попытка извлечь первый валидный JSON-объект из произвольного текста."""
+        start = text.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        return None
+
     def _parse_model(self, payload: Any, model_cls):
         if isinstance(payload, str):
             payload = self._strip_code_fences(payload)
+            if not payload:
+                raise ValueError("Empty model response content")
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError:
+                candidate = self._extract_json_object(payload)
+                if candidate:
+                    try:
+                        data = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        data = None
+                else:
+                    data = None
+
+                if data is not None:
+                    if hasattr(model_cls, "model_validate"):
+                        return model_cls.model_validate(data)
+                    return model_cls.parse_obj(data)
+
                 # fallback: try parse_raw/model_validate_json
                 if hasattr(model_cls, "model_validate_json"):
                     return model_cls.model_validate_json(payload)
@@ -178,9 +232,9 @@ class TaskEstimatorAgent:
             return {"enable_thinking": True}
         return None
 
-    def _request_kwargs(self) -> Dict[str, Any]:
+    def _request_kwargs(self, allow_thinking: bool = True) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {}
-        extra_body = self._extra_body()
+        extra_body = self._extra_body() if allow_thinking else None
         if extra_body is not None:
             kwargs["extra_body"] = extra_body
         return kwargs
@@ -193,62 +247,74 @@ class TaskEstimatorAgent:
         max_tokens: Optional[int] = None,
     ):
         last_err: Optional[Exception] = None
-        for attempt in range(Config.MAX_RETRIES + 1):
-            request_kwargs = self._request_kwargs()
-            if max_tokens is not None and Config.SEND_MAX_TOKENS:
-                request_kwargs["max_tokens"] = max_tokens
+        thinking_modes = [True, False] if Config.ENABLE_THINKING else [False]
 
-            try:
-                # 1) Try parse API (если поддерживается)
-                try:
-                    response = self.client.beta.chat.completions.parse(
-                        model=model,
-                        messages=messages,
-                        response_format=response_model,
-                        temperature=Config.TEMPERATURE,
-                        **request_kwargs,
-                    )
-                    parsed = response.choices[0].message.parsed
-                    if parsed is not None:
-                        return parsed
-                except Exception as e:
-                    last_err = e
+        for allow_thinking in thinking_modes:
+            for attempt in range(Config.MAX_RETRIES + 1):
+                request_kwargs = self._request_kwargs(allow_thinking=allow_thinking)
+                if max_tokens is not None and bool(Config.SEND_MAX_TOKENS):
+                    request_kwargs["max_tokens"] = max_tokens
 
-                # 2) Try JSON-only response format
                 try:
+                    # 1) Try parse API (если поддерживается)
+                    try:
+                        response = self.client.beta.chat.completions.parse(
+                            model=model,
+                            messages=messages,
+                            response_format=response_model,
+                            temperature=Config.TEMPERATURE,
+                            **request_kwargs,
+                        )
+                        parsed = response.choices[0].message.parsed
+                        if parsed is not None:
+                            return parsed
+
+                        parsed_content = self._extract_text_content(response.choices[0].message.content)
+                        if parsed_content.strip():
+                            return self._parse_model(parsed_content, response_model)
+                        raise ValueError("Empty model response content")
+                    except Exception as e:
+                        last_err = e
+
+                    # 2) Try JSON-only response format
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            temperature=Config.TEMPERATURE,
+                            response_format={"type": "json_object"},
+                            **request_kwargs,
+                        )
+                        content = self._extract_text_content(response.choices[0].message.content)
+                        if not content.strip():
+                            raise ValueError("Empty model response content")
+                        return self._parse_model(content, response_model)
+                    except Exception as e:
+                        last_err = e
+
+                    # 3) Plain text fallback
                     response = self.client.chat.completions.create(
                         model=model,
                         messages=messages,
                         temperature=Config.TEMPERATURE,
-                        response_format={"type": "json_object"},
                         **request_kwargs,
                     )
-                    content = response.choices[0].message.content or ""
+                    content = self._extract_text_content(response.choices[0].message.content)
+                    if not content.strip():
+                        raise ValueError("Empty model response content")
                     return self._parse_model(content, response_model)
+
+                except (ValidationError, json.JSONDecodeError) as e:
+                    last_err = e
                 except Exception as e:
                     last_err = e
 
-                # 3) Plain text fallback
-                response = self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=Config.TEMPERATURE,
-                    **request_kwargs,
-                )
-                content = response.choices[0].message.content or ""
-                return self._parse_model(content, response_model)
-
-            except (ValidationError, json.JSONDecodeError) as e:
-                last_err = e
-            except Exception as e:
-                last_err = e
-
-            if attempt < Config.MAX_RETRIES:
-                # Для rate-limit/network/context ошибок выдерживаем backoff и пробуем снова.
-                sleep_sec = Config.RETRY_BACKOFF_SEC * (attempt + 1)
-                if last_err and self._is_retryable_error(last_err):
-                    sleep_sec *= 1.5
-                time.sleep(sleep_sec)
+                if attempt < Config.MAX_RETRIES:
+                    # Для rate-limit/network/context ошибок выдерживаем backoff и пробуем снова.
+                    sleep_sec = Config.RETRY_BACKOFF_SEC * (attempt + 1)
+                    if last_err and self._is_retryable_error(last_err):
+                        sleep_sec *= 1.5
+                    time.sleep(sleep_sec)
 
         raise last_err or RuntimeError("LLM structured call failed")
 
